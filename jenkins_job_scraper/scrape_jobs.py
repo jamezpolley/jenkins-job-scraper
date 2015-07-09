@@ -3,19 +3,26 @@
 import argparse
 import datetime
 import os
-import pprint
 import re
 import sys
 import time
 import urllib
+import logging
 
 from jenkinsapi.jenkins import Jenkins
 from jenkinsapi.utils.requester import Requester
+import requests
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import desc
+
+requests.packages.urllib3.disable_warnings()
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler())
 
 colors = {"SUCCESS": "#0d941d", "FAILURE": "#FF0000", "ABORTED": "#000000"}
 Base = declarative_base()
@@ -44,7 +51,7 @@ job_names = [
 
 now = datetime.datetime.now()
 
-def get_data(stop_after):
+def get_data(stop_after, session):
     for jenkinsnumber in range(1, 8):
         jurl = 'https://jenkins%02d.openstack.org' % jenkinsnumber
         jrequester = Requester(None, None, baseurl=jurl, ssl_verify=False)
@@ -75,13 +82,11 @@ def get_data(stop_after):
                 for param in build.get_actions()['parameters']:
                     if param['name'] == "ZUUL_CHANGE_IDS":
                         gerrit_ref = param["value"].split(" ")[-1]
-                    elif param['name'] == "ZUUL_REF":
-                        zuul_ref = param["value"]
                     elif param['name'] == "ZUUL_PROJECT":
                         zuul_project = param["value"]
                     elif param['name'] == "LOG_PATH":
                         log_path = param["value"]
-                if zuul_ref is None or gerrit_ref is None or log_path is None:
+                if log_path is None:
                     continue
 
                 if thisjob:
@@ -102,7 +107,7 @@ def get_data(stop_after):
             session.commit()
 
 
-def gen_html(html_file, stats_hours):
+def gen_html(html_file, stats_hours, session):
     refs_done = []
     fp = open(html_file, "w")
     fp.write('<html><head/><body><table border="1">')
@@ -121,17 +126,19 @@ def gen_html(html_file, stats_hours):
 
         job_columns = ""
         # Don't need this in a few days 19/2/2015 (once jobs being reported are new format)
-        this_gerrit_ref = job.gerrit_ref.split(" ")[-1]
-        this_gerrit_num = this_gerrit_ref.split(",")[0]
+        this_gerrit_num = this_gerrit_ref = None
+        if job.gerrit_ref:
+            this_gerrit_ref = job.gerrit_ref.split(" ")[-1]
+            this_gerrit_num = this_gerrit_ref.split(",")[0]
         for job_name in job_names:
             job_columns += "<td>"
             for job in session.query(Job).\
-                    filter(Job.zuul_ref == job.zuul_ref).\
+                    # filter(Job.zuul_ref == job.zuul_ref).\
                     filter(Job.name == job_name).\
                     order_by(desc(Job.dt)).all():
 
                 # For recent completed jobs get the logs
-                if job.status in ["SUCCESS","FAILURE","ABORTED"] and "ironic-undercloud" not in job.log_path:
+                if job.status in ["SUCCESS","FAILURE","ABORTED"]:
                     td = now - job.dt
                     if (td.seconds + (td.days*24*60*60)) < (stats_hours * (60*60)):
                         parse_logs('http://logs.openstack.org/%s/console.html' % job.log_path)
@@ -268,14 +275,13 @@ def main(args=sys.argv[1:]):
     engine = create_engine('sqlite:///%s' % opts.d)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    global session
     session = Session()
 
     if opts.f:
-        get_data(opts.n)
-    gen_html(opts.o, 10)
+        get_data(opts.n, session=session)
+    gen_html(opts.o, 48, session=session)
 
-    stats.report("s_" + opts.o, 10)
+    # stats.report("s_" + opts.o, 48)
 
 if __name__ == '__main__':
     exit(main())
