@@ -36,12 +36,9 @@ class Job(Base):
     url = Column(String)
 
 job_names = [
-    'check-tripleo-ironic-undercloud-precise-nonha',
-    'check-tripleo-ironic-overcloud-precise-nonha',
-    'check-tripleo-ironic-overcloud-f21-nonha',
-    'check-tripleo-ironic-overcloud-f21puppet-nonha',
-    'check-tripleo-ironic-overcloud-f21puppet-ha',
-    'check-tripleo-ironic-overcloud-f21puppet-ceph',
+    'periodic-ceilometer-docs-icehouse',
+    'periodic-ceilometer-docs-juno',
+    'periodic-ceilometer-docs-icehouse',
 ]
 
 
