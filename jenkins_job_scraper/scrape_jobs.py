@@ -1,16 +1,16 @@
 #!/usr/bin/python
 
-import argparse
 import datetime
 import os
 import re
 import sys
 import time
-import urllib
-import logging
 
+from jenkinsapi.custom_exceptions import UnknownJob
 from jenkinsapi.jenkins import Jenkins
 from jenkinsapi.utils.requester import Requester
+from oslo_config import cfg
+from oslo_log import log as logging
 import requests
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
@@ -20,12 +20,38 @@ from sqlalchemy import desc
 
 requests.packages.urllib3.disable_warnings()
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.StreamHandler())
-
 colors = {"SUCCESS": "#0d941d", "FAILURE": "#FF0000", "ABORTED": "#000000"}
 Base = declarative_base()
+
+now = datetime.datetime.now()
+
+default_jobs = [
+    'periodic-ceilometer-docs-icehouse',
+    'periodic-ceilometer-docs-juno',
+    'periodic-ceilometer-docs-icehouse']
+
+opts= [
+    cfg.ListOpt('job_names',
+               default=default_jobs,
+               help='List of jobs to gather stats about'),
+    cfg.StrOpt('job_prefix', default='periodic-ceilometer-',
+               help='Prefix to remove in reports'),
+    cfg.BoolOpt('fetch', default=False,
+                        help='Fetch recent data from jenkins servers.'),
+    cfg.IntOpt('max_builds',
+               default=3,
+               help='Stop processing downloading from jenkins after '
+               'hitting this number of builds already in the '
+               'database i.e. assume we already have the rest.'),
+    cfg.StrOpt('html_output_file', default="tripleo-jobs.html", help="html file"),
+    cfg.StrOpt('database_file', default="tripleo-jobs.db", help="sqlite file"),
+    cfg.StrOpt('stats_hours', default=48, help="Number of hours for which "
+               "stats should be gathered. Default: 48")
+]
+
+CONF = cfg.CONF
+CONF.register_cli_opts(opts)
+logging.register_options(CONF)
 
 
 class Job(Base):
@@ -42,23 +68,16 @@ class Job(Base):
     status = Column(String)
     url = Column(String)
 
-job_names = [
-    'periodic-ceilometer-docs-icehouse',
-    'periodic-ceilometer-docs-juno',
-    'periodic-ceilometer-docs-icehouse',
-]
 
-
-now = datetime.datetime.now()
-
-def get_data(stop_after, session):
+def get_data(stop_after, session, job_names, LOG):
     for jenkinsnumber in range(1, 8):
         jurl = 'https://jenkins%02d.openstack.org' % jenkinsnumber
         jrequester = Requester(None, None, baseurl=jurl, ssl_verify=False)
         try:
             jenkins = Jenkins(jurl, requester=jrequester)
+            LOG.debug('Now scraping: %s', jurl)
         except:
-            print "Couldn't connect to %s" % jurl
+            LOG.warn("Couldn't connect to %s" % jurl)
             continue
 
         for jobname in job_names:
@@ -66,18 +85,31 @@ def get_data(stop_after, session):
                 job = jenkins.get_job(jobname)
             except:
                 continue
-            builds = job.get_build_dict().items()
+            LOG.debug('Looking for job: %s', jobname)
+            try:
+                builds = job.get_build_dict().items()
+            except:
+                LOG.warn("Could not retrieve %s", jobname)
+                LOG.warn(e)
+                continue
             builds.sort()
             builds.reverse()
             numhits = 0
             for buildnumber, buildurl in builds:
+                LOG.debug('Checking build number: %s', buildnumber)
                 thisjob = session.query(Job).filter(Job.url == buildurl).all()
                 # these are finised no need to hit jenkins again
                 if thisjob and thisjob[0].status in ["SUCCESS","FAILURE","ABORTED"]:
+                    LOG.debug('Job complete, continuing')
                     continue
                 time.sleep(.3)
-                print "Checking", buildurl
-                build = job.get_build(buildnumber)
+                LOG.info("Checking %s", buildurl)
+                try:
+                    build = job.get_build(buildnumber)
+                except:
+                    LOG.warn("Could not retrieve build %s for %s", buildnumber, jobname)
+                    LOG.warn(e)
+                    continue
                 gerrit_ref = zuul_ref = zuul_project = log_path = None
                 for param in build.get_actions()['parameters']:
                     if param['name'] == "ZUUL_CHANGE_IDS":
@@ -107,13 +139,22 @@ def get_data(stop_after, session):
             session.commit()
 
 
-def gen_html(html_file, stats_hours, session):
+def gen_html(html_file, stats_hours, session, job_names, job_prefix, LOG):
+    LOG.info("Generating %s", html_file)
     refs_done = []
     fp = open(html_file, "w")
-    fp.write('<html><head/><body><table border="1">')
-    fp.write("<tr><td/>")
+
+    if job_prefix[-1] == '-':
+        job_label = job_prefix[:-1]
+    else:
+        job_label = job_prefix
+    fp.write('<html><head/><body>')
+    fp.write('<h1>%s jobs for the last %s hours</h1>' % (job_label, stats_hours))
+    fp.write('Generated: %s<p/>' % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    fp.write('<table border="1">')
+    fp.write("<tr><th/>")
     for job_name in job_names:
-        fp.write("<td><b>%s</b></td>" % job_name.replace("check-tripleo-ironic-", ""))
+        fp.write("<th>%s</th>" % job_name.replace(job_prefix, ""))
     fp.write("</tr>")
     count = 0
     for job in session.query(Job).order_by(desc(Job.dt)):
@@ -133,7 +174,6 @@ def gen_html(html_file, stats_hours, session):
         for job_name in job_names:
             job_columns += "<td>"
             for job in session.query(Job).\
-                    # filter(Job.zuul_ref == job.zuul_ref).\
                     filter(Job.name == job_name).\
                     order_by(desc(Job.dt)).all():
 
@@ -148,13 +188,14 @@ def gen_html(html_file, stats_hours, session):
                 job_columns += '<a STYLE="color : %s" href="%s">%s</a>' % \
                                (color, job.url, job.dt.strftime("%m-%d %H:%M"))
                 job_columns += ' - %.0f min ' % (job.duration / 60)
+                job_columns += ' - %s - ' % job.status
                 job_columns += '<a STYLE="text-decoration:none" '
                 job_columns += 'href="http://logs.openstack.org/%s">log</a>' %\
                                job.log_path
-
-                successes = len(session.query(Job).filter(Job.status == "SUCCESS").filter(Job.name == job_name).filter(Job.gerrit_ref.like("%s,%%" % (this_gerrit_num))).all())
-                failures = len(session.query(Job).filter(Job.status == "FAILURE").filter(Job.name == job_name).filter(Job.gerrit_ref.like("%s,%%" % (this_gerrit_num))).all())
-                job_columns += ' %d/%d' % (successes, (successes+failures))
+                if this_gerrit_num:
+                    successes = len(session.query(Job).filter(Job.status == "SUCCESS").filter(Job.name == job_name).filter(Job.gerrit_ref.like("%s,%%" % (this_gerrit_num))).all())
+                    failures = len(session.query(Job).filter(Job.status == "FAILURE").filter(Job.name == job_name).filter(Job.gerrit_ref.like("%s,%%" % (this_gerrit_num))).all())
+                    job_columns += ' %d/%d' % (successes, (successes+failures))
 
                 job_columns += '</font><br/>'
             job_columns += "</td>"
@@ -162,9 +203,11 @@ def gen_html(html_file, stats_hours, session):
         project = ""
         if job.zuul_project:
             project = job.zuul_project.split("/")[-1]
-        fp.write("<a href=\"https://review.openstack.org/#/c/%s\">%s %s</a></td>"
-                 % (this_gerrit_ref.replace(",", "/"), this_gerrit_ref, project))
-        fp.write(job_columns)
+        if this_gerrit_ref:
+            fp.write("<a href=\"https://review.openstack.org/#/c/%s\">%s %s</a></td>"
+                     % (this_gerrit_ref.replace(",", "/"), this_gerrit_ref, project))
+        else:
+            fp.write("</td>%s" % job_columns)
         fp.write("</tr>")
     fp.write("<table></body></html>")
 
@@ -206,7 +249,7 @@ class Stats:
                     ostats = rstats.setdefault(oname, [])
 
                     datalist = data.split("\n")
-                  
+
                     runtime =  getloglinetime(datalist[-3]) - getloglinetime(datalist[1])
                     ostats.append((url, runtime))
                     break
@@ -256,32 +299,27 @@ def parse_logs(logurl):
     if not os.path.isfile(logfile):
         urllib.urlretrieve(logurl, logfile)
     stats.addLogFile(logurl, logfile)
-    
 
-def main(args=sys.argv[1:]):
-    parser = argparse.ArgumentParser(
-        description=("Get details of tripleo ci jobs and generates a html "
-                     "report."))
-    parser.add_argument('-f', action='store_true',
-                        help='Fetch recent data from jenkins servers.')
-    parser.add_argument('-n', type=int, default=3,
-                        help='Stop processing downloading from jenkins after '
-                             'hitting this number of builds already in the '
-                             'database i.e. assume we already have the rest.')
-    parser.add_argument('-o', default="tripleo-jobs.html", help="html file")
-    parser.add_argument('-d', default="tripleo-jobs.db", help="sqlite file")
-    opts = parser.parse_args(args)
 
-    engine = create_engine('sqlite:///%s' % opts.d)
+def main():
+
+    CONF(sys.argv[1:])
+
+    logging.set_defaults()
+    logging.setup(CONF, 'jenkins-job-scraper')
+    LOG = logging.getLogger(__name__)
+
+    engine = create_engine('sqlite:///%s' % os.path.expanduser(CONF.database_file))
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    if opts.f:
-        get_data(opts.n, session=session)
-    gen_html(opts.o, 48, session=session)
+    if CONF.fetch:
+        get_data(CONF.max_builds, session=session, job_names=CONF.job_names, LOG=LOG)
+    gen_html(os.path.expanduser(CONF.html_output_file), CONF.stats_hours, session=session,
+             job_names=CONF.job_names, job_prefix=CONF.job_prefix, LOG=LOG)
 
-    # stats.report("s_" + opts.o, 48)
+    # stats.report("s_" + CONF.html_output_file, CONF.stats_hours)
 
 if __name__ == '__main__':
     exit(main())

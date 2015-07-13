@@ -1,2 +1,4 @@
 jenkinsapi~=0.2.28
 SQLAlchemy~=1.0.6
+oslo.config~=1.14.0
+oslo.log~=1.6.0
