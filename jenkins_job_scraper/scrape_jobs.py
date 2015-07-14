@@ -90,9 +90,8 @@ def get_data(stop_after, session, job_names, LOG):
             LOG.debug('Looking for job: %s', jobname)
             try:
                 builds = job.get_build_dict().items()
-            except Exception as e:
+            except:
                 LOG.warn("Could not retrieve %s", jobname)
-                LOG.warn(e)
                 continue
             builds.sort()
             builds.reverse()
@@ -111,7 +110,6 @@ def get_data(stop_after, session, job_names, LOG):
                 except:
                     LOG.warn("Could not retrieve build %s for %s", buildnumber,
                              jobname)
-                    LOG.warn(e)
                     continue
                 gerrit_ref = zuul_ref = zuul_project = log_path = None
                 for param in build.get_actions()['parameters']:
